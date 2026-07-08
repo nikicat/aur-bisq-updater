@@ -1,0 +1,111 @@
+name: Update AUR package
+
+on:
+  schedule:
+    - cron: '43 5 * * *'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: Rebuild the current version and dry-run the push (end-to-end test)
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: aur-update
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    container:
+      # archlinux:base-devel as of 2026-07-06. Rolling image pinned by
+      # digest; bump the digest occasionally so the keyring doesn't rot.
+      image: archlinux:base-devel@sha256:b21289eb1954872de0dc9f88976627e38611b1817be75e50946c83ab7b9c474d
+    env:
+      SIGNING_KEY_FPR: B493319106CC3D1F252E19CBF806F422E222AA02 # Alejandro García <alejandro.garcia@disroot.org>
+    steps:
+      - name: Install build environment
+        run: |
+          pacman -Syu --noconfirm --needed archlinux-keyring
+          pacman -Syu --noconfirm --needed git jdk21-openjdk jq openssh sudo
+          useradd -m builder
+
+      - name: Check for new upstream release
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # The AUR repo is the single source of truth for the PKGBUILD, so
+          # direct pushes by co-maintainers are picked up, never overwritten.
+          git clone https://aur.archlinux.org/bisq.git aur
+          current=$(grep -oP '^pkgver=\K.+' aur/PKGBUILD)
+          latest=$(curl -fsSL -H "Authorization: Bearer $GH_TOKEN" \
+            https://api.github.com/repos/bisq-network/bisq/releases/latest | jq -er .tag_name)
+          latest=${latest#v}
+          echo "AUR has $current, latest upstream release is $latest"
+          if [ "$(vercmp "$latest" "$current")" -gt 0 ]; then
+            echo "version=$latest" >>"$GITHUB_OUTPUT"
+          elif [ "${{ inputs.force }}" = "true" ]; then
+            echo "force run: rebuilding $current and dry-running the push"
+            echo "version=$current" >>"$GITHUB_OUTPUT"
+            echo "push_flags=--dry-run" >>"$GITHUB_OUTPUT"
+          else
+            echo "Nothing to do."
+          fi
+
+      - name: Import Bisq release signing key
+        if: steps.check.outputs.version
+        run: |
+          curl -fsSL https://bisq.network/pubkey/E222AA02.asc -o /tmp/signing-key.asc
+          fpr=$(gpg --show-keys --with-colons /tmp/signing-key.asc | awk -F: '$1 == "fpr" { print $10; exit }')
+          if [ "$fpr" != "$SIGNING_KEY_FPR" ]; then
+            echo "::error::unexpected signing key fingerprint: $fpr"
+            exit 1
+          fi
+          sudo -u builder -H gpg --import /tmp/signing-key.asc
+
+      - name: Bump, build and verify
+        if: steps.check.outputs.version
+        run: |
+          cd aur
+          sed -i \
+            -e 's/^pkgver=.*/pkgver=${{ steps.check.outputs.version }}/' \
+            -e 's/^pkgrel=.*/pkgrel=1/' \
+            PKGBUILD
+          chown -R builder: .
+          # makepkg verifies the PGP-signed release tag (?signed +
+          # validpgpkeys) and checks out the bitcoind submodule revision
+          # recorded in that tag, then builds all split packages.
+          sudo -u builder -H makepkg -Cf --noconfirm
+          sudo -u builder -H makepkg --printsrcinfo > .SRCINFO
+
+      - name: Push to AUR
+        if: steps.check.outputs.version
+        env:
+          AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+        run: |
+          mkdir -p -m 700 ~/.ssh
+          printf '%s\n' "$AUR_SSH_PRIVATE_KEY" >~/.ssh/aur
+          chmod 600 ~/.ssh/aur
+          {
+            echo 'aur.archlinux.org ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEuBKrPzbawxA/k2g6NcyV5jmqwJ2s+zpgZGZ7tpLIcN'
+            echo 'aur.archlinux.org ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBLMiLrP8pVi5BFX2i3vepSUnpedeiewE5XptnUnau+ZoeUOPkpoCgZZuYfpaIQfhhJJI5qgnjJmr4hyJbe/zxow='
+          } >>~/.ssh/known_hosts
+          git config --global --add safe.directory "$PWD/aur"
+          cd aur
+          git config user.name 'Bisq AUR Updater'
+          git config user.email 'aur-bisq-updater@noreply.invalid'
+          git remote set-url origin ssh://aur@aur.archlinux.org/bisq.git
+          git add PKGBUILD .SRCINFO
+          if git diff --cached --quiet; then
+            echo "No changes to commit (force run against current version)"
+          else
+            git commit \
+              -m 'Update to version ${{ steps.check.outputs.version }}' \
+              -m 'Automated by https://github.com/nikicat/aur-bisq-updater'
+          fi
+          git -c core.sshCommand='ssh -i ~/.ssh/aur -o IdentitiesOnly=yes' \
+            push ${{ steps.check.outputs.push_flags }} origin master
