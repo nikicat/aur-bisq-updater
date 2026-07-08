@@ -45,6 +45,13 @@ jobs:
           latest=$(curl -fsSL -H "Authorization: Bearer $GH_TOKEN" \
             https://api.github.com/repos/bisq-network/bisq/releases/latest | jq -er .tag_name)
           latest=${latest#v}
+          # Reject anything that isn't a plain version string. The tag name is
+          # attacker-influenced (upstream release), and it later reaches a
+          # shell/sed context; an allowlist keeps shell metacharacters out.
+          if ! printf '%s' "$latest" | grep -qE '^[0-9][A-Za-z0-9._+]*$'; then
+            echo "::error::refusing unexpected upstream tag: $latest"
+            exit 1
+          fi
           echo "AUR has $current, latest upstream release is $latest"
           if [ "$(vercmp "$latest" "$current")" -gt 0 ]; then
             echo "version=$latest" >>"$GITHUB_OUTPUT"
@@ -69,10 +76,12 @@ jobs:
 
       - name: Bump, build and verify
         if: steps.check.outputs.version
+        env:
+          VERSION: ${{ steps.check.outputs.version }}
         run: |
           cd aur
           sed -i \
-            -e 's/^pkgver=.*/pkgver=${{ steps.check.outputs.version }}/' \
+            -e "s/^pkgver=.*/pkgver=$VERSION/" \
             -e 's/^pkgrel=.*/pkgrel=1/' \
             PKGBUILD
           chown -R builder: .
@@ -86,6 +95,7 @@ jobs:
         if: steps.check.outputs.version
         env:
           AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+          VERSION: ${{ steps.check.outputs.version }}
         run: |
           # Explicit paths everywhere: the runner sets HOME=/github/home in
           # container jobs, but OpenSSH expands ~ from the passwd database
@@ -107,7 +117,7 @@ jobs:
             echo "No changes to commit (force run against current version)"
           else
             git commit \
-              -m 'Update to version ${{ steps.check.outputs.version }}' \
+              -m "Update to version $VERSION" \
               -m 'Automated by https://github.com/nikicat/aur-bisq-updater'
           fi
           git -c core.sshCommand="ssh -i $HOME/.ssh/aur -o IdentitiesOnly=yes -o UserKnownHostsFile=$HOME/.ssh/known_hosts -o StrictHostKeyChecking=yes" \
