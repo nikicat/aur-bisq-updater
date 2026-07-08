@@ -87,13 +87,16 @@ jobs:
         env:
           AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
         run: |
-          mkdir -p -m 700 ~/.ssh
-          printf '%s\n' "$AUR_SSH_PRIVATE_KEY" >~/.ssh/aur
-          chmod 600 ~/.ssh/aur
+          # Explicit paths everywhere: the runner sets HOME=/github/home in
+          # container jobs, but OpenSSH expands ~ from the passwd database
+          # (/root), so relying on ~ makes ssh miss these files.
+          mkdir -p -m 700 "$HOME/.ssh"
+          printf '%s\n' "$AUR_SSH_PRIVATE_KEY" >"$HOME/.ssh/aur"
+          chmod 600 "$HOME/.ssh/aur"
           {
             echo 'aur.archlinux.org ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEuBKrPzbawxA/k2g6NcyV5jmqwJ2s+zpgZGZ7tpLIcN'
             echo 'aur.archlinux.org ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBLMiLrP8pVi5BFX2i3vepSUnpedeiewE5XptnUnau+ZoeUOPkpoCgZZuYfpaIQfhhJJI5qgnjJmr4hyJbe/zxow='
-          } >>~/.ssh/known_hosts
+          } >>"$HOME/.ssh/known_hosts"
           git config --global --add safe.directory "$PWD/aur"
           cd aur
           git config user.name 'Bisq AUR Updater'
@@ -107,5 +110,5 @@ jobs:
               -m 'Update to version ${{ steps.check.outputs.version }}' \
               -m 'Automated by https://github.com/nikicat/aur-bisq-updater'
           fi
-          git -c core.sshCommand='ssh -i ~/.ssh/aur -o IdentitiesOnly=yes' \
+          git -c core.sshCommand="ssh -i $HOME/.ssh/aur -o IdentitiesOnly=yes -o UserKnownHostsFile=$HOME/.ssh/known_hosts -o StrictHostKeyChecking=yes" \
             push ${{ steps.check.outputs.push_flags }} origin master
