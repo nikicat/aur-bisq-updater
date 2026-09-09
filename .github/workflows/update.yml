@@ -1,4 +1,4 @@
-name: Update AUR package
+name: Update AUR packages
 
 on:
   schedule:
@@ -20,6 +20,18 @@ jobs:
   update:
     runs-on: ubuntu-latest
     timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - pkg: bisq
+            repo: bisq-network/bisq
+          - pkg: bisq2
+            repo: bisq-network/bisq2
+            # bisq2 tags are not PGP-verifiable (lightweight tags on
+            # GitHub-web-flow-signed commits), so the PKGBUILD pins the git
+            # source by sha256 of `git archive` instead; refresh it on bump.
+            updpkgsums: true
     container:
       # archlinux:base-devel as of 2026-07-06. Rolling image pinned by
       # digest; bump the digest occasionally so the keyring doesn't rot.
@@ -30,8 +42,10 @@ jobs:
       - name: Install build environment
         run: |
           pacman -Syu --noconfirm --needed archlinux-keyring
-          pacman -Syu --noconfirm --needed git jdk21-openjdk jq openssh sudo
+          pacman -Syu --noconfirm --needed git jdk21-openjdk jq openssh pacman-contrib sudo
           useradd -m builder
+          # makepkg -s installs whatever depends/makedepends the PKGBUILD declares.
+          echo 'builder ALL=(root) NOPASSWD: /usr/bin/pacman' >/etc/sudoers.d/builder
 
       - name: Check for new upstream release
         id: check
@@ -40,10 +54,10 @@ jobs:
         run: |
           # The AUR repo is the single source of truth for the PKGBUILD, so
           # direct pushes by co-maintainers are picked up, never overwritten.
-          git clone https://aur.archlinux.org/bisq.git aur
+          git clone https://aur.archlinux.org/${{ matrix.pkg }}.git aur
           current=$(grep -oP '^pkgver=\K.+' aur/PKGBUILD)
           latest=$(curl -fsSL -H "Authorization: Bearer $GH_TOKEN" \
-            https://api.github.com/repos/bisq-network/bisq/releases/latest | jq -er .tag_name)
+            https://api.github.com/repos/${{ matrix.repo }}/releases/latest | jq -er .tag_name)
           latest=${latest#v}
           # Reject anything that isn't a plain version string. The tag name is
           # attacker-influenced (upstream release), and it later reaches a
@@ -85,10 +99,13 @@ jobs:
             -e 's/^pkgrel=.*/pkgrel=1/' \
             PKGBUILD
           chown -R builder: .
+          if [ "${{ matrix.updpkgsums }}" = "true" ]; then
+            sudo -u builder -H updpkgsums
+          fi
           # makepkg verifies the PGP-signed release tag (?signed +
-          # validpgpkeys) and checks out the bitcoind submodule revision
-          # recorded in that tag, then builds all split packages.
-          sudo -u builder -H makepkg -Cf --noconfirm
+          # validpgpkeys) and/or the pinned source checksums, checks out the
+          # bitcoind submodule revision recorded in that tag, then builds.
+          sudo -u builder -H makepkg -Csf --noconfirm
           sudo -u builder -H makepkg --printsrcinfo > .SRCINFO
 
       - name: Push to AUR
@@ -111,7 +128,7 @@ jobs:
           cd aur
           git config user.name 'Bisq AUR Updater'
           git config user.email 'aur-bisq-updater@noreply.invalid'
-          git remote set-url origin ssh://aur@aur.archlinux.org/bisq.git
+          git remote set-url origin ssh://aur@aur.archlinux.org/${{ matrix.pkg }}.git
           git add PKGBUILD .SRCINFO
           if git diff --cached --quiet; then
             echo "No changes to commit (force run against current version)"
